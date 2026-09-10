@@ -199,10 +199,13 @@ func (m *Marshal) printCode(ctx context.Context, code string) error {
 			return err
 		}
 	}
-	if err := ask("FEED", "6"); err != nil {
+	// As ukaz ends its own cards: the cutter sits above the print head, so
+	// the last lines are advanced past it first, or the cut lands in them.
+	// 8 is ukaz's CONFIG_PRINTER_FEED_BEFORE_CUT, found on the hardware.
+	if err := ask("FEED", "8"); err != nil {
 		return err
 	}
-	return ask("CUT", "PART")
+	return ask("CUT", "FULL")
 }
 
 // ─── requests ────────────────────────────────────────────────────────
