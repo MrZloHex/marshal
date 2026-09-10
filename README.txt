@@ -108,10 +108,6 @@
     go build -o bin/marshal ./cmd/marshal
     go test ./...
 
-  Until monolink v0.2.2 is tagged, build against the local checkout:
-
-    export GOWORK=$HOME/Projects/monolith/monolink.work
-
 
   ───────────────────────────────────────────────────────────────
   ▓ CONFIGURATION
