@@ -64,7 +64,7 @@ type Marshal struct {
 	opt   Options
 	now   func() time.Time
 
-	users, sessions, enrolling *monolink.Property
+	users, sessions, enrolling, people *monolink.Property
 
 	mu         sync.Mutex
 	st         *State
@@ -92,6 +92,10 @@ func New(c *monolink.Client, store *Store, opt Options) (*Marshal, error) {
 	m.users = node.Prop("USERS.COUNT", monolink.Int(0, 1000), "people in the bubble")
 	m.sessions = node.Prop("SESSIONS.COUNT", monolink.Int(0, 100000), "sessions open")
 	m.enrolling = node.Prop("ENROLLING", monolink.Bool(), "nobody exists yet; an enrolment code is out")
+	// Who is in the bubble, readable by any node — synapse must know whom a
+	// message can go to. Names are no secret inside the household; what
+	// each may do is, and GET:USERS stays behind MARSHAL.*.
+	m.people = node.Prop("PEOPLE", monolink.Str(0), "the people of the bubble, a record of names")
 
 	if len(st.Users) == 0 {
 		if m.enrolCode, err = newEnrolCode(); err != nil {
@@ -721,10 +725,18 @@ func (m *Marshal) save() error {
 func (m *Marshal) publish() {
 	m.mu.Lock()
 	users, sessions, enrolling := len(m.st.Users), len(m.st.Sessions), m.enrolCode != ""
+	names := make([]string, 0, len(m.st.Users))
+	for n := range m.st.Users {
+		names = append(names, n)
+	}
 	m.mu.Unlock()
+	sort.Strings(names)
 	m.users.Set(strconv.Itoa(users))
 	m.sessions.Set(strconv.Itoa(sessions))
 	m.enrolling.Set(onOff(enrolling))
+	if err := m.people.Set(monolink.Record(names...)); err != nil {
+		log.Error("PEOPLE does not fit in one field", "people", len(names), "err", err)
+	}
 }
 
 // onOff is a bool as the wire writes one (SPEC §19).

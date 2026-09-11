@@ -89,8 +89,9 @@
   (locked out), NAC (no such session, person or grant), STATE (exists
   already, enrolment closed, last "*"), ARG, ARGC.
 
-  Properties, as every node has: USERS.COUNT, SESSIONS.COUNT, ENROLLING,
-  UPTIME, VERSION.
+  Properties: USERS.COUNT, SESSIONS.COUNT, ENROLLING, UPTIME, VERSION, and
+  PEOPLE — the names alone, a record (dasha|mzh), readable by any node and
+  published on change, so synapse knows whom a message can go to.
 
 
   ───────────────────────────────────────────────────────────────

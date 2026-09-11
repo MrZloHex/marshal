@@ -252,6 +252,26 @@ func TestSignInAndAdministerPeople(t *testing.T) {
 	}
 }
 
+// PEOPLE names everyone, for synapse to know whom a message can go to. Any
+// node may read it; what each person may do stays behind MARSHAL.*.
+func TestPeopleIsReadableAndPublished(t *testing.T) {
+	b, _, mv, _ := enrolled(t)
+	node := b.panel(t, "SYNAPSE")
+	if r, err := node.RequestDialect(tctx(t), monolink.V2, NodeName, monolink.VerbGet, "PEOPLE"); err != nil || r.Arg(0) != "mzh" {
+		t.Fatalf("PEOPLE %+v, %v", r, err)
+	}
+	if err := auth.NewUser(tctx(t), mv, "dasha", "pa55"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for !slices.ContainsFunc(b.relayed(), func(f string) bool { return strings.HasSuffix(f, ":MARSHAL:ALL:PUB:PEOPLE:dasha|mzh") }) {
+		if time.Now().After(deadline) {
+			t.Fatalf("PEOPLE not published; relayed: %q", b.relayed())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestWrongSecretsLockTheNameOut(t *testing.T) {
 	b, _, _, _ := enrolled(t)
 	web := b.panel(t, "MONOWEB")
