@@ -221,6 +221,32 @@ func (k *panelKey) signIn(t *testing.T, c *monolink.Client, name string) (auth.S
 	return auth.SignInKey(tctx(t), c, name, k.cred.ID, k.priv)
 }
 
+// enrol and redeem offer a key as its panel does: with the key's answer to
+// a challenge, since marshal takes no key its offerer does not hold.
+func (k *panelKey) enrol(t *testing.T, c *monolink.Client, code, name string) (auth.Session, error) {
+	t.Helper()
+	return auth.Enrol(tctx(t), c, code, name, k.cred, auth.KeyProof(k.priv, name, c.NodeID()))
+}
+
+func (k *panelKey) redeem(t *testing.T, c *monolink.Client, code, name string) (auth.Session, error) {
+	t.Helper()
+	return auth.Redeem(tctx(t), c, code, name, k.cred, auth.KeyProof(k.priv, name, c.NodeID()))
+}
+
+func (k *passkey) proof() auth.Proof {
+	return auth.PasskeyProof(func(nonce string) (auth.Assertion, error) { return k.sign(nonce), nil })
+}
+
+func (k *passkey) enrol(t *testing.T, c *monolink.Client, code, name string) (auth.Session, error) {
+	t.Helper()
+	return auth.Enrol(tctx(t), c, code, name, k.cred, k.proof())
+}
+
+func (k *passkey) redeem(t *testing.T, c *monolink.Client, code, name string) (auth.Session, error) {
+	t.Helper()
+	return auth.Redeem(tctx(t), c, code, name, k.cred, k.proof())
+}
+
 // enrolled starts marshal and makes mzh the first person, with monoview's
 // key, signed in at MONOVIEW.
 func enrolled(t *testing.T) (*bus, *Marshal, *monolink.Client, auth.Session) {
@@ -228,7 +254,7 @@ func enrolled(t *testing.T) (*bus, *Marshal, *monolink.Client, auth.Session) {
 	b := newBus(t)
 	m, _ := startMarshal(t, b, filepath.Join(t.TempDir(), "marshal.json"))
 	mv := b.panel(t, "MONOVIEW")
-	s, err := auth.Enrol(tctx(t), mv, strings.ToLower(m.EnrolCode()), "mzh", newPanelKey(t).cred)
+	s, err := newPanelKey(t).enrol(t, mv, strings.ToLower(m.EnrolCode()), "mzh")
 	if err != nil {
 		t.Fatalf("enrol: %v", err)
 	}
@@ -238,17 +264,17 @@ func enrolled(t *testing.T) (*bus, *Marshal, *monolink.Client, auth.Session) {
 	return b, m, mv, s
 }
 
-// invited has inviter invite name, and a phone take the invitation up
-// through a MONOWEB of its own.
-func invited(t *testing.T, b *bus, inviter *monolink.Client, name string) (*monolink.Client, *passkey, auth.Session) {
+// invited has inviter, in the session token names, invite name, and a phone
+// take the invitation up through a MONOWEB of its own.
+func invited(t *testing.T, b *bus, inviter *monolink.Client, token, name string) (*monolink.Client, *passkey, auth.Session) {
 	t.Helper()
-	c, _, err := auth.Invite(tctx(t), inviter, name)
+	c, _, err := auth.Invite(tctx(t), inviter, token, name)
 	if err != nil {
 		t.Fatalf("invite %s: %v", name, err)
 	}
 	web := b.panel(t, "MONOWEB")
 	k := newPasskey(t, name+"'s phone")
-	s, err := auth.Redeem(tctx(t), web, c, name, k.cred)
+	s, err := k.redeem(t, web, c, name)
 	if err != nil {
 		t.Fatalf("redeem for %s: %v", name, err)
 	}
@@ -263,7 +289,7 @@ func TestEnrolmentMakesTheFirstPersonOnce(t *testing.T) {
 	m, _ := startMarshal(t, b, filepath.Join(t.TempDir(), "marshal.json"))
 	mv := b.panel(t, "MONOVIEW")
 	key := newPanelKey(t)
-	s, err := auth.Enrol(tctx(t), mv, strings.ToLower(m.EnrolCode()), "mzh", key.cred)
+	s, err := key.enrol(t, mv, strings.ToLower(m.EnrolCode()), "mzh")
 	if err != nil || s.User != "mzh" || s.Token == "" || !s.Expires.After(time.Now()) {
 		t.Fatalf("session %+v, %v", s, err)
 	}
@@ -272,7 +298,7 @@ func TestEnrolmentMakesTheFirstPersonOnce(t *testing.T) {
 		t.Fatal("enrolment code survived its use")
 	}
 	other := b.panel(t, "MONOWEB")
-	if _, err := auth.Enrol(tctx(t), other, "0000-0000-0000", "eve", newPasskey(t, "").cred); code(err) != monolink.CodeState {
+	if _, err := newPasskey(t, "").enrol(t, other, "0000-0000-0000", "eve"); code(err) != monolink.CodeState {
 		t.Fatalf("second enrolment: %v", err)
 	}
 	if g, err := auth.Grants(tctx(t), mv, "mzh"); err != nil || !slices.Equal(g, []string{"*"}) {
@@ -291,14 +317,14 @@ func TestWrongCodesLockOut(t *testing.T) {
 	m, _ := startMarshal(t, b, filepath.Join(t.TempDir(), "marshal.json"))
 	mv := b.panel(t, "MONOVIEW")
 	for i := 0; i < freeFailures; i++ {
-		if _, err := auth.Enrol(tctx(t), mv, "0000-0000-0000", "mzh", newPanelKey(t).cred); code(err) != monolink.CodeDenied {
+		if _, err := newPanelKey(t).enrol(t, mv, "0000-0000-0000", "mzh"); code(err) != monolink.CodeDenied {
 			t.Fatalf("attempt %d: %v", i, err)
 		}
 	}
-	if _, err := auth.Enrol(tctx(t), mv, "0000-0000-0000", "mzh", newPanelKey(t).cred); code(err) != monolink.CodeBusy {
+	if _, err := newPanelKey(t).enrol(t, mv, "0000-0000-0000", "mzh"); code(err) != monolink.CodeBusy {
 		t.Fatalf("a wrong code during the lockout: %v", err)
 	}
-	if _, err := auth.Enrol(tctx(t), mv, m.EnrolCode(), "mzh", newPanelKey(t).cred); err != nil {
+	if _, err := newPanelKey(t).enrol(t, mv, m.EnrolCode(), "mzh"); err != nil {
 		t.Fatalf("the right code during the lockout: %v", err)
 	}
 }
@@ -306,8 +332,8 @@ func TestWrongCodesLockOut(t *testing.T) {
 // ─── passkeys ────────────────────────────────────────────────────────
 
 func TestAPasskeySignsIn(t *testing.T) {
-	b, _, mv, _ := enrolled(t)
-	_, phone, _ := invited(t, b, mv, "dasha")
+	b, _, mv, s := enrolled(t)
+	_, phone, _ := invited(t, b, mv, s.Token, "dasha")
 
 	web := b.panel(t, "MONOWEB")
 	s, err := phone.signIn(t, web)
@@ -344,11 +370,11 @@ func TestAPasskeySignsIn(t *testing.T) {
 // Nothing signs in by knowing a name: a panel's key answers only for its
 // person, and only with its own signature.
 func TestAPanelKeyAnswersForItsPersonOnly(t *testing.T) {
-	b, _, mv, _ := enrolled(t)
-	invited(t, b, mv, "dasha")
+	b, _, mv, s := enrolled(t)
+	invited(t, b, mv, s.Token, "dasha")
 	laptop := newPanelKey(t)
-	c, _, _ := auth.Invite(tctx(t), mv, "mzh")
-	if _, err := auth.Redeem(tctx(t), b.panel(t, "MONOVIEW"), c, "mzh", laptop.cred); err != nil {
+	c, _, _ := auth.Invite(tctx(t), mv, s.Token, "mzh")
+	if _, err := laptop.redeem(t, b.panel(t, "MONOVIEW"), c, "mzh"); err != nil {
 		t.Fatal(err)
 	}
 	other := b.panel(t, "MONOVIEW")
@@ -366,33 +392,33 @@ func TestAPanelKeyAnswersForItsPersonOnly(t *testing.T) {
 // ─── invitations and keys ────────────────────────────────────────────
 
 func TestInvitations(t *testing.T) {
-	b, _, mv, _ := enrolled(t)
-	web, _, _ := invited(t, b, mv, "dasha")
+	b, _, mv, s := enrolled(t)
+	web, _, ds := invited(t, b, mv, s.Token, "dasha")
 	if g, _ := auth.Grants(tctx(t), web, "dasha"); len(g) != 0 {
 		t.Fatalf("someone new starts with grants %q", g)
 	}
 
 	// dasha may invite herself, for another device, and nobody else.
-	if _, _, err := auth.Invite(tctx(t), web, "eve"); code(err) != monolink.CodeDenied {
+	if _, _, err := auth.Invite(tctx(t), web, ds.Token, "eve"); code(err) != monolink.CodeDenied {
 		t.Fatalf("dasha invited someone new: %v", err)
 	}
-	if _, _, err := auth.Invite(tctx(t), web, "mzh"); code(err) != monolink.CodeDenied {
+	if _, _, err := auth.Invite(tctx(t), web, ds.Token, "mzh"); code(err) != monolink.CodeDenied {
 		t.Fatalf("dasha gave herself a way to be mzh: %v", err)
 	}
-	c, exp, err := auth.Invite(tctx(t), web, "dasha")
+	c, exp, err := auth.Invite(tctx(t), web, ds.Token, "dasha")
 	if err != nil || !exp.After(time.Now()) || exp.After(time.Now().Add(inviteTTL+time.Minute)) {
 		t.Fatalf("her own invitation: %s %v, %v", c, exp, err)
 	}
 
 	// The code is for dasha, and works once.
 	laptop := b.panel(t, "MONOWEB")
-	if _, err := auth.Redeem(tctx(t), laptop, c, "eve", newPasskey(t, "").cred); code(err) != monolink.CodeDenied {
+	if _, err := newPasskey(t, "").redeem(t, laptop, c, "eve"); code(err) != monolink.CodeDenied {
 		t.Fatalf("dasha's code made eve: %v", err)
 	}
-	if s, err := auth.Redeem(tctx(t), laptop, strings.ToLower(c), "dasha", newPasskey(t, "laptop").cred); err != nil || s.User != "dasha" {
+	if s, err := newPasskey(t, "laptop").redeem(t, laptop, strings.ToLower(c), "dasha"); err != nil || s.User != "dasha" {
 		t.Fatalf("redeemed: %+v, %v", s, err)
 	}
-	if _, err := auth.Redeem(tctx(t), laptop, c, "dasha", newPasskey(t, "").cred); code(err) != monolink.CodeDenied {
+	if _, err := newPasskey(t, "").redeem(t, laptop, c, "dasha"); code(err) != monolink.CodeDenied {
 		t.Fatalf("an invitation used twice: %v", err)
 	}
 	if u, _ := auth.Users(tctx(t), mv); !slices.Equal(u, []string{"dasha", "mzh"}) {
@@ -401,11 +427,11 @@ func TestInvitations(t *testing.T) {
 }
 
 func TestAPersonLooksAfterTheirKeys(t *testing.T) {
-	b, _, mv, _ := enrolled(t)
-	web, _, phoneSession := invited(t, b, mv, "dasha")
-	c, _, _ := auth.Invite(tctx(t), web, "dasha")
+	b, _, mv, s := enrolled(t)
+	web, _, phoneSession := invited(t, b, mv, s.Token, "dasha")
+	c, _, _ := auth.Invite(tctx(t), web, phoneSession.Token, "dasha")
 	laptop := b.panel(t, "MONOWEB")
-	laptopSession, err := auth.Redeem(tctx(t), laptop, c, "dasha", newPasskey(t, "laptop").cred)
+	laptopSession, err := newPasskey(t, "laptop").redeem(t, laptop, c, "dasha")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +447,7 @@ func TestAPersonLooksAfterTheirKeys(t *testing.T) {
 	}
 
 	// The phone is lost: removing its key ends what it opened, and only that.
-	if err := auth.RemoveKey(tctx(t), laptop, "dasha", keys[0].Ref); err != nil {
+	if err := auth.RemoveKey(tctx(t), laptop, laptopSession.Token, "dasha", keys[0].Ref); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := auth.Resume(tctx(t), web, phoneSession.Token); code(err) != monolink.CodeNAC {
@@ -431,16 +457,16 @@ func TestAPersonLooksAfterTheirKeys(t *testing.T) {
 		t.Fatalf("the laptop's session ended with it: %v", err)
 	}
 	b.heard(t, ":MARSHAL:CONCENTRATOR:STOP:TICKETS:dasha")
-	if err := auth.RemoveKey(tctx(t), laptop, "dasha", keys[1].Ref); code(err) != monolink.CodeState {
+	if err := auth.RemoveKey(tctx(t), laptop, laptopSession.Token, "dasha", keys[1].Ref); code(err) != monolink.CodeState {
 		t.Fatalf("removed the last key: %v", err)
 	}
 }
 
 func TestAKeyIsNobodysButOnePersons(t *testing.T) {
-	b, _, mv, _ := enrolled(t)
-	_, phone, _ := invited(t, b, mv, "dasha")
-	c, _, _ := auth.Invite(tctx(t), mv, "olga")
-	if _, err := auth.Redeem(tctx(t), b.panel(t, "MONOWEB"), c, "olga", phone.cred); code(err) != monolink.CodeState {
+	b, _, mv, s := enrolled(t)
+	_, phone, _ := invited(t, b, mv, s.Token, "dasha")
+	c, _, _ := auth.Invite(tctx(t), mv, s.Token, "olga")
+	if _, err := phone.redeem(t, b.panel(t, "MONOWEB"), c, "olga"); code(err) != monolink.CodeState {
 		t.Fatalf("dasha's key given to olga too: %v", err)
 	}
 }
@@ -448,10 +474,10 @@ func TestAKeyIsNobodysButOnePersons(t *testing.T) {
 // ─── people and grants ───────────────────────────────────────────────
 
 func TestAdministerPeople(t *testing.T) {
-	b, _, mv, _ := enrolled(t)
+	b, _, mv, s := enrolled(t)
 	ctx := tctx(t)
-	web, phone, _ := invited(t, b, mv, "dasha")
-	if err := auth.Grant(ctx, mv, "dasha", "VERTEX.*"); err != nil {
+	web, phone, _ := invited(t, b, mv, s.Token, "dasha")
+	if err := auth.Grant(ctx, mv, s.Token, "dasha", "VERTEX.*"); err != nil {
 		t.Fatal(err)
 	}
 	ds, err := phone.signIn(t, web)
@@ -466,7 +492,7 @@ func TestAdministerPeople(t *testing.T) {
 	if _, err := auth.Grants(ctx, web, "mzh"); code(err) != monolink.CodeDenied {
 		t.Fatalf("someone else's grants: %v", err)
 	}
-	if err := auth.Grant(ctx, web, "dasha", "*"); code(err) != monolink.CodeDenied {
+	if err := auth.Grant(ctx, web, ds.Token, "dasha", "*"); code(err) != monolink.CodeDenied {
 		t.Fatalf("dasha granted herself everything: %v", err)
 	}
 
@@ -481,15 +507,15 @@ func TestAdministerPeople(t *testing.T) {
 	}
 
 	// Nobody can remove the last person holding "*", nor take it from them.
-	if err := auth.RemoveUser(ctx, mv, "mzh"); code(err) != monolink.CodeState {
+	if err := auth.RemoveUser(ctx, mv, s.Token, "mzh"); code(err) != monolink.CodeState {
 		t.Fatalf("removed the last administrator: %v", err)
 	}
-	if err := auth.Revoke(ctx, mv, "mzh", "*"); code(err) != monolink.CodeState {
+	if err := auth.Revoke(ctx, mv, s.Token, "mzh", "*"); code(err) != monolink.CodeState {
 		t.Fatalf("revoked the last *: %v", err)
 	}
 
 	// Removing a person ends their sessions, and their keys go with them.
-	if err := auth.RemoveUser(ctx, mv, "dasha"); err != nil {
+	if err := auth.RemoveUser(ctx, mv, s.Token, "dasha"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := auth.Resume(ctx, web, ds.Token); code(err) != monolink.CodeNAC {
@@ -503,12 +529,12 @@ func TestAdministerPeople(t *testing.T) {
 // PEOPLE names everyone, for synapse to know whom a message can go to. Any
 // node may read it; what each person may do stays behind MARSHAL.*.
 func TestPeopleIsReadableAndPublished(t *testing.T) {
-	b, _, mv, _ := enrolled(t)
+	b, _, mv, s := enrolled(t)
 	node := b.panel(t, "SYNAPSE")
 	if r, err := node.RequestDialect(tctx(t), monolink.V2, NodeName, monolink.VerbGet, "PEOPLE"); err != nil || r.Arg(0) != "mzh" {
 		t.Fatalf("PEOPLE %+v, %v", r, err)
 	}
-	invited(t, b, mv, "dasha")
+	invited(t, b, mv, s.Token, "dasha")
 	b.heard(t, ":MARSHAL:ALL:PUB:PEOPLE:dasha|mzh")
 }
 
@@ -537,9 +563,9 @@ func TestATicketIsSignedForTheSessionsPanel(t *testing.T) {
 
 // A change in grants ends the person's tickets at the hub at once.
 func TestAGrantEndsTickets(t *testing.T) {
-	b, _, mv, _ := enrolled(t)
-	invited(t, b, mv, "dasha")
-	if err := auth.Grant(tctx(t), mv, "dasha", "VERTEX.*"); err != nil {
+	b, _, mv, s := enrolled(t)
+	invited(t, b, mv, s.Token, "dasha")
+	if err := auth.Grant(tctx(t), mv, s.Token, "dasha", "VERTEX.*"); err != nil {
 		t.Fatal(err)
 	}
 	b.heard(t, ":MARSHAL:CONCENTRATOR:STOP:TICKETS:dasha")
@@ -573,7 +599,7 @@ func TestSessionsSurviveARestartAndAreStoredHashed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "marshal.json")
 	m, stop := startMarshal(t, b, path)
 	mv := b.panel(t, "MONOVIEW")
-	s, err := auth.Enrol(tctx(t), mv, m.EnrolCode(), "mzh", newPanelKey(t).cred)
+	s, err := newPanelKey(t).enrol(t, mv, m.EnrolCode(), "mzh")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -623,14 +649,15 @@ func TestAStateFromBeforeKeysReopensEnrolment(t *testing.T) {
 		t.Fatal("nobody can sign in, and enrolment is closed")
 	}
 	mv := b.panel(t, "MONOVIEW")
-	if _, err := auth.Enrol(tctx(t), mv, m.EnrolCode(), "mzh", newPanelKey(t).cred); err != nil {
+	s, err := newPanelKey(t).enrol(t, mv, m.EnrolCode(), "mzh")
+	if err != nil {
 		t.Fatal(err)
 	}
 	mv.SetActor("mzh")
 	if ss, err := auth.Sessions(tctx(t), mv); err != nil || len(ss) != 1 {
 		t.Fatalf("sessions %+v, %v", ss, err)
 	}
-	web, _, _ := invited(t, b, mv, "dasha")
+	web, _, _ := invited(t, b, mv, s.Token, "dasha")
 	if g, err := auth.Grants(tctx(t), web, "dasha"); err != nil || !slices.Equal(g, []string{"VERTEX.*"}) {
 		t.Fatalf("dasha came back with %q, %v", g, err)
 	}

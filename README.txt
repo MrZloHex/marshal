@@ -13,8 +13,9 @@
   to marshal and nobody else.
 
   Its own records it guards itself. A request to change people must come
-  from <panel>.<person>, that panel must hold a live session for that
-  person, and their grants must cover MARSHAL.<VERB>.<NOUN>.
+  from <panel>.<person>, name a session that person holds at that panel —
+  signed in within the last five minutes — and their grants must cover
+  MARSHAL.<VERB>.<NOUN>.
 
 
   ───────────────────────────────────────────────────────────────
@@ -43,14 +44,20 @@
   ▪ A panel's key signs "monolith-key\0<name>\0<panel>\0<nonce>".
   ▪ Nothing is locked out for a wrong signature: a signature cannot be
     guessed. Codes can, and are (below).
+  ▪ A key is taken only from whoever holds it: ENROL and REDEEM carry the
+    new key's answer to a challenge, as it would sign in — a panel key's
+    signature, or the new passkey's assertion (so the app asks for the
+    passkey twice: to make it, and to use it). Nothing checks what a device
+    attests about itself: a passkey is as safe as the device that keeps it.
   ▪ A session belongs to the panel that opened it, and to the key that
     opened it. It lasts an hour unused; SET:SESSION and every GET:TICKET
     extend it, so a panel still connected keeps it, and one gone lets it
     lapse.
 
   The panel side is `github.com/MrZloHex/monolink/marshal`: Challenge,
-  SignInPasskey, SignInKey, Enrol, Redeem, Resume, SignOut, and the calls
-  below. Use it rather than reimplementing the checks.
+  SignInPasskey, SignInKey, Enrol and Redeem (with KeyProof or
+  PasskeyProof), Resume, SignOut, and the calls below. Use it rather than
+  reimplementing the checks.
 
 
   ───────────────────────────────────────────────────────────────
@@ -77,8 +84,11 @@
   ▪ Someone else who exists needs MARSHAL.SET.KEY, and every grant they
     hold: whoever has a key of theirs can become them. It is how a person
     who lost every device gets back.
-  ▪ Every invitation needs a sign-in within the last five minutes: a new
-    key must not come of a session someone left open, or took.
+  ▪ An invitation, like every change to people, keys or grants, names the
+    session it is made in, and that session must have signed in within
+    the last five minutes: a new key must not come of a session someone
+    left open, or took — and another session's fresh sign-in, even at the
+    same panel, lends it nothing.
   ▪ An invitation is judged again when taken up. One for someone new adds
     no key to whoever has the name by then; one whose maker has lost the
     grant for it, been removed, or had a key removed since, is void — a
@@ -103,30 +113,41 @@
     AUTH:CHALLENGE                            -> OK:CHALLENGE:<nonce>
     AUTH:PASSKEY:<nonce>:<id>:<ad>:<sig>:<cd>… -> OK:SESSION:<token>:<name>:<expires>
     AUTH:KEY:<nonce>:<name>:<id>:<sig>        -> OK:SESSION:…
-    AUTH:ENROL:<code>:<name>:<credential>     -> OK:SESSION:…
-    AUTH:REDEEM:<code>:<name>:<credential>    -> OK:SESSION:…
+    AUTH:ENROL:<code>:<name>:<credential>:<proof>   -> OK:SESSION:…
+    AUTH:REDEEM:<code>:<name>:<credential>:<proof>  -> OK:SESSION:…
     SET:SESSION:<token>                       -> OK:SESSION:<token>:<name>:<expires>
     STOP:SESSION:<token>                      -> OK:SESSION:<token>:<name>:<now>
     GET:ALLOW:<token>:<action>                -> OK:ALLOW:YES | OK:ALLOW:NO:<reason>
     GET:TICKET:<token>                        -> OK:TICKET:<person>:<panel>:<expires>:<sig>[:<grant>...]
 
-  A credential is <kind>:<id>:<alg>:<key>[:<label>] — webauthn or ed25519,
+  A credential is <kind>:<id>:<alg>:<key>:<label> — webauthn or ed25519,
   the credential id (base64url), the COSE algorithm (-7 ES256, -8 EdDSA),
   the public key as SubjectPublicKeyInfo DER (base64url), and what the
-  person calls it: at most 48 bytes, no ":", "|" or "%".
+  person calls it, empty if nothing: at most 48 bytes, no ":", "|" or "%".
+  A proof is the key's answer to an AUTH:CHALLENGE of the same panel's:
+  <nonce>:<signature> for a panel's key, signed as it signs in; for a
+  passkey, AUTH:PASSKEY's arguments, made by the new passkey. A wrong proof
+  leaves the code good; the challenge is spent either way.
 
   Administration — each is the action MARSHAL.<VERB>.<NOUN>:
 
     GET:SESSIONS                              -> OK:SESSIONS[:<user>|<panel>|<since>...]  the newest sixteen
-    STOP:SESSIONS:<name>                      -> OK:SESSIONS:<name>:<ended>  yourself: no grant needed
+    STOP:SESSIONS:<token>:<name>              -> OK:SESSIONS:<name>:<ended>  yourself: no grant needed
     GET:USERS                                 -> OK:USERS[:<name>...]
-    NEW:INVITE:<name>                         -> OK:INVITE:<code>:<expires>   see above
+    NEW:INVITE:<token>:<name>                 -> OK:INVITE:<code>:<expires>   see above
     GET:KEYS:<name>                           -> OK:KEYS[:<ref>|<kind>|<label>|<added>...]  yourself: no grant needed
-    STOP:KEY:<name>:<ref>                     -> OK:KEY:<name>:<ref>  yourself: no grant needed
-    STOP:USER:<name>                          -> OK:USER:<name>
-    SET:GRANT:<user>:<pattern>                -> OK:GRANT:<user>
-    STOP:GRANT:<user>:<pattern>               -> OK:GRANT:<user>
+    STOP:KEY:<token>:<name>:<ref>             -> OK:KEY:<name>:<ref>  yourself: no grant needed
+    STOP:USER:<token>:<name>                  -> OK:USER:<name>
+    SET:GRANT:<token>:<user>:<pattern>        -> OK:GRANT:<user>
+    STOP:GRANT:<token>:<user>:<pattern>       -> OK:GRANT:<user>
     GET:GRANTS:<user>                         -> OK:GRANTS[:<pattern>...]  yourself: no grant needed
+
+  A change names the session it is made in by its <token>: a session of
+  the sender's person, at the sender's panel, signed in within the last
+  five minutes — past that, sign in again and name the new session. The
+  hub vouches for the panel and the person, never for which session of
+  theirs: every browser is MONOWEB. Signing oneself out everywhere needs
+  the session alone, however old.
 
   A key's <ref> is the first 8 bytes of the SHA-256 of its credential id,
   hex. Removing a key ends the sessions it opened; the last key stays.
@@ -146,7 +167,7 @@
   person's tickets at the hub — it cannot tell one session's from
   another's — and their other panels simply ask for new ones.
 
-  STOP:SESSIONS:<name> signs a person out everywhere: every session,
+  STOP:SESSIONS:<token>:<name> signs a person out everywhere: every session,
   invitation and ticket of theirs, for when a device is gone and its token
   with it. Their keys stay; STOP:KEY removes one known lost.
 

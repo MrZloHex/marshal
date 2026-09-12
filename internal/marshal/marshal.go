@@ -331,22 +331,31 @@ var arity = map[string][2]int{
 	"AUTH:CHALLENGE": {0, 0},
 	"AUTH:PASSKEY":   {5, 16}, // nonce, credential, authenticator data, signature, client data…
 	"AUTH:KEY":       {4, 4},  // nonce, name, credential, signature
-	"AUTH:ENROL":     {6, 7},  // code, name, kind, id, alg, key[, label]
-	"AUTH:REDEEM":    {6, 7},  // code, name, kind, id, alg, key[, label]
-	"SET:SESSION":    {1, 1},  // token
-	"STOP:SESSION":   {1, 1},  // token
-	"GET:SESSIONS":   {0, 0},
-	"STOP:SESSIONS":  {1, 1}, // name: every session, invitation and ticket of theirs
-	"GET:ALLOW":      {2, 2}, // token, action
-	"GET:TICKET":     {1, 1}, // token
-	"GET:USERS":      {0, 0},
-	"NEW:INVITE":     {1, 1}, // name
-	"GET:KEYS":       {1, 1}, // name
-	"STOP:KEY":       {2, 2}, // name, ref
-	"STOP:USER":      {1, 1}, // name
-	"SET:GRANT":      {2, 2}, // user, pattern
-	"STOP:GRANT":     {2, 2}, // user, pattern
-	"GET:GRANTS":     {1, 1}, // user
+	// code, name, kind, id, alg, key, label, then the key's proof: a
+	// challenge and a panel key's signature, or AUTH:PASSKEY's arguments.
+	"AUTH:ENROL":    {9, 16},
+	"AUTH:REDEEM":   {9, 16},
+	"SET:SESSION":   {1, 1}, // token
+	"STOP:SESSION":  {1, 1}, // token
+	"GET:SESSIONS":  {0, 0},
+	"STOP:SESSIONS": {2, 2}, // token, name: every session, invitation and ticket of theirs
+	"GET:ALLOW":     {2, 2}, // token, action
+	"GET:TICKET":    {1, 1}, // token
+	"GET:USERS":     {0, 0},
+	"NEW:INVITE":    {2, 2}, // token, name
+	"GET:KEYS":      {1, 1}, // name
+	"STOP:KEY":      {3, 3}, // token, name, ref
+	"STOP:USER":     {2, 2}, // token, name
+	"SET:GRANT":     {3, 3}, // token, user, pattern
+	"STOP:GRANT":    {3, 3}, // token, user, pattern
+	"GET:GRANTS":    {1, 1}, // user
+}
+
+// changes are the requests that change people, keys or grants. Each names
+// the session it is made in by its token, first.
+var changes = map[string]bool{
+	"NEW:INVITE": true, "STOP:KEY": true, "STOP:USER": true,
+	"SET:GRANT": true, "STOP:GRANT": true, "STOP:SESSIONS": true,
 }
 
 // Cmd serves every request to marshal that its object model does not:
@@ -440,10 +449,14 @@ func (m *Marshal) serve(msg monolink.Message) (string, []string, error) {
 		return m.passkey(panel, a, now)
 	case "AUTH:KEY":
 		return m.panelKey(panel, a[0], a[1], a[2], a[3], now)
-	case "AUTH:ENROL":
-		return m.enrol(panel, a[0], a[1], a[2:], now)
-	case "AUTH:REDEEM":
-		return m.redeem(panel, a[0], a[1], a[2:], now)
+	case "AUTH:ENROL", "AUTH:REDEEM":
+		// The challenge is spent whatever becomes of the request: a wrong code
+		// does not leave it lying about.
+		answered := m.answered(panel, a[7], now)
+		if key == "AUTH:ENROL" {
+			return m.enrol(panel, a[0], a[1], a[2:7], a[7:], answered, now)
+		}
+		return m.redeem(panel, a[0], a[1], a[2:7], a[7:], answered, now)
 	case "SET:SESSION":
 		return m.keepAlive(panel, a[0], now)
 	case "STOP:SESSION":
@@ -460,6 +473,23 @@ func (m *Marshal) serve(msg monolink.Message) (string, []string, error) {
 	if !ok {
 		return "", nil, monolink.Fail(monolink.CodeDenied, "sign in first")
 	}
+	// The hub vouches for the panel and the person, not for which of their
+	// sessions there — every browser is MONOWEB — so a change names its
+	// session, and that session itself must be a recent sign-in. A session
+	// left open, or taken, cannot add a key, remove one or hand on grants —
+	// whatever would outlive signing it out — and another session's fresh
+	// sign-in lends it nothing. Signing oneself out everywhere takes nothing
+	// but sessions, and needs only a session.
+	if changes[key] {
+		s, _, err := m.session(panel, a[0], now)
+		if err != nil || s.User != who {
+			return "", nil, monolink.Fail(monolink.CodeDenied, "not a session of yours at this panel")
+		}
+		a = a[1:]
+		if now.Sub(s.Since) > freshSignIn && !(key == "STOP:SESSIONS" && a[0] == who) {
+			return "", nil, monolink.Fail(monolink.CodeDenied, "sign in again: a change to people, keys or grants needs a sign-in within five minutes")
+		}
+	}
 	switch key {
 	case "GET:GRANTS", "GET:KEYS", "STOP:KEY", "STOP:SESSIONS":
 		if a[0] != who {
@@ -470,11 +500,6 @@ func (m *Marshal) serve(msg monolink.Message) (string, []string, error) {
 	case "NEW:INVITE":
 		if err := m.mayInvite(who, a[0]); err != nil {
 			return "", nil, err
-		}
-		// A new key must not come of a session someone left open, or took:
-		// that would outlive every sign-out.
-		if !m.fresh(from, now) {
-			return "", nil, monolink.Fail(monolink.CodeDenied, "sign in again first: a new key needs a sign-in within five minutes")
 		}
 	default:
 		if err := m.permit(who, msg.Verb, msg.Noun); err != nil {
@@ -611,7 +636,7 @@ func (m *Marshal) panelKey(panel, nonce, name, id, sig string, now time.Time) (s
 
 // enrol makes the first person, by the code marshal printed: their key,
 // and every grant. It is open only while nobody can sign in.
-func (m *Marshal) enrol(panel, code, name string, cred []string, now time.Time) (string, []string, error) {
+func (m *Marshal) enrol(panel, code, name string, cred, proof []string, answered bool, now time.Time) (string, []string, error) {
 	if m.enrolCode == "" {
 		return "", nil, monolink.Fail(monolink.CodeState, "enrolment is closed")
 	}
@@ -626,6 +651,9 @@ func (m *Marshal) enrol(panel, code, name string, cred []string, now time.Time) 
 	}
 	c, err := m.newKey(name, cred)
 	if err != nil {
+		return "", nil, err
+	}
+	if err := m.proven(panel, name, &c, proof, answered); err != nil {
 		return "", nil, err
 	}
 	snap := m.snapshot()
@@ -679,6 +707,49 @@ func (m *Marshal) newKey(name string, args []string) (auth.Credential, error) {
 		return auth.Credential{}, monolink.Fail(monolink.CodeState, "as many keys as a person may have")
 	}
 	return c, nil
+}
+
+// proven checks that whoever offers c holds it: c answered proof[0], a
+// challenge this panel took up (answered) — a panel's key by signing name in
+// here, a passkey as it signs in, the person verified. A code says a key may
+// be added, not whose it is; without this, anyone could offer a key they had
+// only seen, and whoever held it would sign in as name.
+//
+// It is no attestation. What keeps a passkey — a phone's secure hardware,
+// or software — only the device knows: marshal learns that the key signs
+// for this site, and that the device says it verified the person.
+func (m *Marshal) proven(panel, name string, c *auth.Credential, proof []string, answered bool) error {
+	nonce := proof[0]
+	if c.Kind == auth.KindEd25519 {
+		if len(proof) != 2 {
+			return monolink.Fail(monolink.CodeArgc, "a panel's key is proven by a challenge and its signature")
+		}
+		sig, err := base64.RawURLEncoding.DecodeString(proof[1])
+		if !answered || err != nil || auth.VerifyKey(*c, name, panel, nonce, sig) != nil {
+			return monolink.Fail(monolink.CodeDenied, "the key did not answer the challenge")
+		}
+		return nil
+	}
+	_, a, err := auth.ParsePasskeyArgs(proof)
+	if err != nil {
+		return monolink.Fail(monolink.CodeArg, err.Error())
+	}
+	if !answered {
+		return monolink.Fail(monolink.CodeDenied, "no such challenge")
+	}
+	if m.opt.Site.ID == "" {
+		return monolink.Fail(monolink.CodeState, "marshal is not set up for passkeys")
+	}
+	if a.CredentialID != c.ID {
+		return monolink.Fail(monolink.CodeDenied, "another passkey answered")
+	}
+	count, err := m.opt.Site.VerifyAssertion(*c, nonce, a)
+	if err != nil {
+		log.Warn("NEW PASSKEY REFUSED", "user", name, "why", err)
+		return monolink.Fail(monolink.CodeDenied, "the passkey did not answer the challenge")
+	}
+	c.Count = count
+	return nil
 }
 
 // mayInvite says whether who may make an invitation by which name adds a
@@ -747,7 +818,7 @@ func (m *Marshal) invite(by, name string, now time.Time) (string, []string, erro
 
 // redeem takes an invitation up: the code must be for name, and the key
 // becomes theirs — if the invitation may still do what it was made for.
-func (m *Marshal) redeem(panel, code, name string, cred []string, now time.Time) (string, []string, error) {
+func (m *Marshal) redeem(panel, code, name string, cred, proof []string, answered bool, now time.Time) (string, []string, error) {
 	guesses := panel + "/" + name
 	h := hashCode(code)
 	iv, ok := m.invites[h]
@@ -781,6 +852,11 @@ func (m *Marshal) redeem(panel, code, name string, cred []string, now time.Time)
 	}
 	c, err := m.newKey(name, cred)
 	if err != nil {
+		return "", nil, err
+	}
+	// A wrong proof keeps the invitation: the code was right, and whoever
+	// holds it may try again with a key they hold.
+	if err := m.proven(panel, name, &c, proof, answered); err != nil {
 		return "", nil, err
 	}
 	snap := m.snapshot()
@@ -1100,17 +1176,6 @@ func (m *Marshal) actor(from monolink.Address, now time.Time) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-// fresh reports whether the person from speaks for signed in at that panel
-// within freshSignIn.
-func (m *Marshal) fresh(from monolink.Address, now time.Time) bool {
-	for _, s := range m.st.Sessions {
-		if s.User == from.Actor && s.Panel == from.Node && now.Before(s.Expires) && now.Sub(s.Since) <= freshSignIn {
-			return true
-		}
-	}
-	return false
 }
 
 // permit lets who do MARSHAL.<verb>.<noun> if a grant of theirs covers it.

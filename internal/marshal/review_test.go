@@ -2,12 +2,12 @@ package marshal
 
 // A review on 2026-09-12 reproduced each of these as a weakness (its report
 // is kept outside the repository). Here they are the invariants that hold
-// now. F01 — an invitation's recent sign-in may be another browser's session
-// of the same person — needs each request to name its session, and is not
-// among them yet.
+// now.
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,11 +33,8 @@ func reviewFixture(t *testing.T) (*Marshal, *panelKey, string) {
 	now := time.Now().Truncate(time.Millisecond)
 	m.now = func() time.Time { return now }
 	key := newPanelKey(t)
-	_, args, err := m.enrol("MONOWEB", m.EnrolCode(), "owner", key.cred.Args(), now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return m, key, args[0]
+	token := reviewOK(t, m, "MONOWEB", "AUTH", "ENROL", reg(m.EnrolCode(), "owner", key.cred, key.answer(t, m, "MONOWEB", "owner"))...)[0]
+	return m, key, token
 }
 
 func reviewCall(m *Marshal, from, verb, noun string, args ...string) (string, []string, error) {
@@ -62,15 +59,121 @@ func reviewTicket(t *testing.T, m *Marshal, token string) auth.Ticket {
 	return tk
 }
 
+// reg is AUTH:ENROL's and AUTH:REDEEM's arguments.
+func reg(code, name string, c auth.Credential, proof []string) []string {
+	return append(append([]string{code, name}, c.Args()...), proof...)
+}
+
+// answer is a panel key's proof: its signature for name at panel, over a
+// challenge of panel's.
+func (k *panelKey) answer(t *testing.T, m *Marshal, panel, name string) []string {
+	t.Helper()
+	nonce := reviewOK(t, m, panel, "AUTH", "CHALLENGE")[0]
+	return []string{nonce, base64.RawURLEncoding.EncodeToString(ed25519.Sign(k.priv, auth.KeyMessage(name, panel, nonce)))}
+}
+
+// answer is a passkey's proof: its assertion over a challenge of panel's.
+func (k *passkey) answer(t *testing.T, m *Marshal, panel string) []string {
+	t.Helper()
+	nonce := reviewOK(t, m, panel, "AUTH", "CHALLENGE")[0]
+	return auth.PasskeyArgs(nonce, k.sign(nonce))
+}
+
+// F01, W01: a change needs its own session to be a recent sign-in. Another
+// session's — the same person's, at the same panel name, as every browser is
+// MONOWEB — lends it nothing; and removing keys, changing grants and
+// removing people need it as much as inviting does.
+func TestAChangeNeedsItsOwnSessionFresh(t *testing.T) {
+	m, key, old := reviewFixture(t)
+	iv := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", old, "guest")[0]
+	guest := newPasskey(t, "phone")
+	guestToken := reviewOK(t, m, "MONOWEB", "AUTH", "REDEEM", reg(iv, "guest", guest.cred, guest.answer(t, m, "MONOWEB"))...)[0]
+
+	later := m.now().Add(freshSignIn + time.Minute)
+	m.now = func() time.Time { return later }
+	changes := [][]string{
+		{"NEW", "INVITE", "owner"},
+		{"STOP", "KEY", "owner", key.cred.Ref()},
+		{"SET", "GRANT", "guest", "VERTEX.*"},
+		{"STOP", "GRANT", "owner", "*"},
+		{"STOP", "USER", "guest"},
+		{"STOP", "SESSIONS", "guest"},
+	}
+	refused := func(why, from, token string) {
+		t.Helper()
+		for _, c := range changes {
+			args := append([]string{token}, c[2:]...)
+			if _, _, err := reviewCall(m, from, c[0], c[1], args...); code(err) != monolink.CodeDenied {
+				t.Errorf("%s: %s:%s %v", why, c[0], c[1], err)
+			}
+		}
+	}
+	refused("from a sign-in long past", "MONOWEB.owner", old)
+
+	// The owner signs in again, in another browser: the old session is no
+	// fresher for it.
+	nonce := reviewOK(t, m, "MONOWEB", "AUTH", "CHALLENGE")[0]
+	sig := base64.RawURLEncoding.EncodeToString(ed25519.Sign(key.priv, auth.KeyMessage("owner", "MONOWEB", nonce)))
+	fresh := reviewOK(t, m, "MONOWEB", "AUTH", "KEY", nonce, "owner", key.cred.ID, sig)[0]
+	refused("another session's sign-in lent the old one its freshness", "MONOWEB.owner", old)
+	refused("a session named by someone not its person", "MONOWEB.guest", fresh)
+	refused("no session at all", "MONOWEB.owner", "nonsense")
+
+	reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", fresh, "owner")
+	reviewOK(t, m, "MONOWEB.owner", "SET", "GRANT", fresh, "guest", "VERTEX.*")
+	// Signing oneself out everywhere takes nothing but sessions, and needs
+	// only a session.
+	reviewOK(t, m, "MONOWEB.guest", "STOP", "SESSIONS", guestToken, "guest")
+}
+
+// I1, W05: a key is taken only from whoever holds it — its answer to a
+// challenge of that panel's, for that name — and a wrong answer keeps the
+// invitation for the key's holder.
+func TestAKeyIsTakenOnlyFromItsHolder(t *testing.T) {
+	m, _, token := reviewFixture(t)
+	iv := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", token, "guest")[0]
+	phone, thief, laptop := newPasskey(t, "phone"), newPasskey(t, ""), newPanelKey(t)
+
+	forged := func() []string {
+		nonce := reviewOK(t, m, "MONOWEB", "AUTH", "CHALLENGE")[0]
+		a := thief.sign(nonce)
+		a.CredentialID = phone.cred.ID
+		return auth.PasskeyArgs(nonce, a)
+	}()
+	elsewhere := phone.answer(t, m, "MONOVIEW")
+	unasked := auth.PasskeyArgs("bm9uY2U", phone.sign("bm9uY2U"))
+	for why, try := range map[string][]string{
+		"another passkey's answer":          reg(iv, "guest", phone.cred, thief.answer(t, m, "MONOWEB")),
+		"another key's signature under its": reg(iv, "guest", phone.cred, forged),
+		"another panel's challenge":         reg(iv, "guest", phone.cred, elsewhere),
+		"a challenge nobody asked for":      reg(iv, "guest", phone.cred, unasked),
+		"a panel key signing another name":  reg(iv, "guest", laptop.cred, laptop.answer(t, m, "MONOWEB", "owner")),
+		"a panel key signing for another":   reg(iv, "guest", laptop.cred, laptop.answer(t, m, "MONOVIEW", "guest")),
+	} {
+		if _, _, err := reviewCall(m, "MONOWEB", "AUTH", "REDEEM", try...); code(err) != monolink.CodeDenied {
+			t.Errorf("%s: %v", why, err)
+		}
+	}
+	if len(m.st.Users) != 1 {
+		t.Fatal("someone was made of a key nobody proved")
+	}
+	s := reviewOK(t, m, "MONOWEB", "AUTH", "REDEEM", reg(iv, "guest", phone.cred, phone.answer(t, m, "MONOWEB"))...)
+	if s[1] != "guest" || m.st.Users["guest"].Keys[0].Count != phone.count {
+		t.Fatalf("the holder's own key: %q, counter %d", s, m.st.Users["guest"].Keys[0].Count)
+	}
+}
+
 // F02: removing a stolen key voids what it made while it was trusted — a
 // self-invitation would otherwise let the thief register a new key.
 func TestAnInvitationDiesWithTheKeyThatMadeIt(t *testing.T) {
-	m, stolen, _ := reviewFixture(t)
-	iv := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", "owner")[0]
-	reviewOK(t, m, "MONOVIEW", "AUTH", "REDEEM", append([]string{iv, "owner"}, newPanelKey(t).cred.Args()...)...)
-	backdoor := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", "owner")[0]
-	reviewOK(t, m, "MONOVIEW.owner", "STOP", "KEY", "owner", stolen.cred.Ref())
-	_, _, err := reviewCall(m, "MONOWEB", "AUTH", "REDEEM", append([]string{backdoor, "owner"}, newPanelKey(t).cred.Args()...)...)
+	m, stolen, token := reviewFixture(t)
+	iv := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", token, "owner")[0]
+	laptop := newPanelKey(t)
+	laptopToken := reviewOK(t, m, "MONOVIEW", "AUTH", "REDEEM", reg(iv, "owner", laptop.cred, laptop.answer(t, m, "MONOVIEW", "owner"))...)[0]
+	backdoor := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", token, "owner")[0]
+	reviewOK(t, m, "MONOVIEW.owner", "STOP", "KEY", laptopToken, "owner", stolen.cred.Ref())
+	thief := newPanelKey(t)
+	_, _, err := reviewCall(m, "MONOWEB", "AUTH", "REDEEM", reg(backdoor, "owner", thief.cred, thief.answer(t, m, "MONOWEB", "owner"))...)
 	if code(err) != monolink.CodeState {
 		t.Fatalf("an invitation outlived the key that made it: %v", err)
 	}
@@ -113,9 +216,9 @@ func TestAnEndedSessionEndsItsTickets(t *testing.T) {
 func TestARevocationCoversEveryTicketBeforeIt(t *testing.T) {
 	m, _, token := reviewFixture(t)
 	m.st.Users["owner"].Grants = []string{"MARSHAL.SET.GRANT", "MARSHAL.STOP.GRANT", "VERTEX.*"}
-	reviewOK(t, m, "MONOWEB.owner", "SET", "GRANT", "owner", "VERTEX.GET.LED")
+	reviewOK(t, m, "MONOWEB.owner", "SET", "GRANT", token, "owner", "VERTEX.GET.LED")
 	tk := reviewTicket(t, m, token)
-	reviewOK(t, m, "MONOWEB.owner", "STOP", "GRANT", "owner", "VERTEX.*")
+	reviewOK(t, m, "MONOWEB.owner", "STOP", "GRANT", token, "owner", "VERTEX.*")
 	if tk.Issued.After(m.ended["owner"]) {
 		t.Fatalf("a ticket signed at %v outlives the cutoff at %v", tk.Issued, m.ended["owner"])
 	}
@@ -124,8 +227,8 @@ func TestARevocationCoversEveryTicketBeforeIt(t *testing.T) {
 // F05: an ended ticket's cutoff is saved with the change, survives a
 // restart, and is let go only once every ticket it covers has expired.
 func TestAnEndedTicketIsKeptUntilTheHubHasIt(t *testing.T) {
-	m, _, _ := reviewFixture(t)
-	reviewOK(t, m, "MONOWEB.owner", "SET", "GRANT", "owner", "VERTEX.*")
+	m, _, token := reviewFixture(t)
+	reviewOK(t, m, "MONOWEB.owner", "SET", "GRANT", token, "owner", "VERTEX.*")
 	disk, err := m.store.Load()
 	if err != nil {
 		t.Fatal(err)
@@ -155,9 +258,9 @@ func TestAnEndedTicketIsKeptUntilTheHubHasIt(t *testing.T) {
 func TestNoGrantBeyondWhatATicketHolds(t *testing.T) {
 	m, _, token := reviewFixture(t)
 	for i := len(m.st.Users["owner"].Grants); i < auth.MaxTicketGrants; i++ {
-		reviewOK(t, m, "MONOWEB.owner", "SET", "GRANT", "owner", fmt.Sprintf("VERTEX.GET.P%d", i))
+		reviewOK(t, m, "MONOWEB.owner", "SET", "GRANT", token, "owner", fmt.Sprintf("VERTEX.GET.P%d", i))
 	}
-	if _, _, err := reviewCall(m, "MONOWEB.owner", "SET", "GRANT", "owner", "VERTEX.GET.ONE.TOO.MANY"); code(err) != monolink.CodeState {
+	if _, _, err := reviewCall(m, "MONOWEB.owner", "SET", "GRANT", token, "owner", "VERTEX.GET.ONE.TOO.MANY"); code(err) != monolink.CodeState {
 		t.Fatalf("a grant beyond a ticket's: %v", err)
 	}
 	reviewTicket(t, m, token)
@@ -166,16 +269,17 @@ func TestNoGrantBeyondWhatATicketHolds(t *testing.T) {
 // F07: nobody can take every invitation. A newer one for the same name
 // replaces the older, and each inviter has a few at most.
 func TestNobodyTakesEveryInvitation(t *testing.T) {
-	m, _, _ := reviewFixture(t)
-	iv := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", "guest")[0]
-	reviewOK(t, m, "MONOWEB", "AUTH", "REDEEM", append([]string{iv, "guest"}, newPanelKey(t).cred.Args()...)...)
+	m, _, token := reviewFixture(t)
+	iv := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", token, "guest")[0]
+	key := newPanelKey(t)
+	guestToken := reviewOK(t, m, "MONOWEB", "AUTH", "REDEEM", reg(iv, "guest", key.cred, key.answer(t, m, "MONOWEB", "guest"))...)[0]
 	for range maxInvites + 1 {
-		reviewOK(t, m, "MONOWEB.guest", "NEW", "INVITE", "guest")
+		reviewOK(t, m, "MONOWEB.guest", "NEW", "INVITE", guestToken, "guest")
 	}
 	for i := range maxInvitesEach {
-		reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", fmt.Sprintf("someone%d", i))
+		reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", token, fmt.Sprintf("someone%d", i))
 	}
-	if _, _, err := reviewCall(m, "MONOWEB.owner", "NEW", "INVITE", "one-too-many"); code(err) != monolink.CodeBusy {
+	if _, _, err := reviewCall(m, "MONOWEB.owner", "NEW", "INVITE", token, "one-too-many"); code(err) != monolink.CodeBusy {
 		t.Fatalf("an inviter beyond their quota: %v", err)
 	}
 }
@@ -183,16 +287,20 @@ func TestNobodyTakesEveryInvitation(t *testing.T) {
 // F08: a stranger's wrong guesses never block a right code: codes are 60
 // bits. Past five, the guesser is told to wait.
 func TestAStrangersGuessesDoNotBlockARightCode(t *testing.T) {
-	m, _, _ := reviewFixture(t)
-	iv := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", "guest")[0]
-	cred := newPasskey(t, "guest").cred.Args()
-	for range freeFailures {
-		reviewCall(m, "MONOWEB", "AUTH", "REDEEM", append([]string{"0000-0000-0000", "guest"}, cred...)...)
+	m, _, token := reviewFixture(t)
+	iv := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", token, "guest")[0]
+	pass := newPasskey(t, "guest")
+	guess := func() error {
+		_, _, err := reviewCall(m, "MONOWEB", "AUTH", "REDEEM", reg("0000-0000-0000", "guest", pass.cred, pass.answer(t, m, "MONOWEB"))...)
+		return err
 	}
-	if _, _, err := reviewCall(m, "MONOWEB", "AUTH", "REDEEM", append([]string{"0000-0000-0000", "guest"}, cred...)...); code(err) != monolink.CodeBusy {
+	for range freeFailures {
+		guess()
+	}
+	if err := guess(); code(err) != monolink.CodeBusy {
 		t.Fatalf("a guesser past five tries: %v", err)
 	}
-	reviewOK(t, m, "MONOWEB", "AUTH", "REDEEM", append([]string{iv, "guest"}, cred...)...)
+	reviewOK(t, m, "MONOWEB", "AUTH", "REDEEM", reg(iv, "guest", pass.cred, pass.answer(t, m, "MONOWEB"))...)
 }
 
 // F09: every answer fits a frame, and PEOPLE always names everyone.
@@ -209,10 +317,10 @@ func TestEveryAnswerFitsAFrame(t *testing.T) {
 		}
 	})
 	t.Run("people", func(t *testing.T) {
-		m, _, _ := reviewFixture(t)
+		m, _, token := reviewFixture(t)
 		for i := 0; ; i++ {
 			name := fmt.Sprintf("%030d", i)
-			_, _, err := reviewCall(m, "MONOWEB.owner", "NEW", "INVITE", name)
+			_, _, err := reviewCall(m, "MONOWEB.owner", "NEW", "INVITE", token, name)
 			if err != nil {
 				if code(err) != monolink.CodeState {
 					t.Fatalf("a person too many: %v", err)
@@ -259,16 +367,17 @@ func TestAFailedSaveChangesNothing(t *testing.T) {
 		})
 	}
 	t.Run("passkey counter", func(t *testing.T) {
-		m, _, _ := reviewFixture(t)
+		m, _, token := reviewFixture(t)
 		pass := newPasskey(t, "phone")
-		iv := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", "guest")[0]
-		reviewOK(t, m, "MONOWEB", "AUTH", "REDEEM", append([]string{iv, "guest"}, pass.cred.Args()...)...)
+		iv := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", token, "guest")[0]
+		reviewOK(t, m, "MONOWEB", "AUTH", "REDEEM", reg(iv, "guest", pass.cred, pass.answer(t, m, "MONOWEB"))...)
+		was := m.st.Users["guest"].Keys[0].Count
 		m.store = NewStore(filepath.Join(t.TempDir(), "missing", "state.json"))
 		nonce := reviewOK(t, m, "MONOWEB", "AUTH", "CHALLENGE")[0]
 		if _, _, err := reviewCall(m, "MONOWEB", "AUTH", "PASSKEY", auth.PasskeyArgs(nonce, pass.sign(nonce))...); code(err) != monolink.CodeInternal {
 			t.Fatalf("expected the save to fail: %v", err)
 		}
-		if m.st.Users["guest"].Keys[0].Count != 0 {
+		if m.st.Users["guest"].Keys[0].Count != was {
 			t.Fatal("a failed sign-in moved the counter in memory")
 		}
 	})
@@ -280,12 +389,12 @@ func TestASaveThatCannotSyncItsDirectoryChangesNothing(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root reads any directory")
 	}
-	m, _, _ := reviewFixture(t)
+	m, _, token := reviewFixture(t)
 	dir := filepath.Dir(m.store.path)
 	if err := os.Chmod(dir, 0o300); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := reviewCall(m, "MONOWEB.owner", "SET", "GRANT", "owner", "UKAZ.*")
+	_, _, err := reviewCall(m, "MONOWEB.owner", "SET", "GRANT", token, "owner", "UKAZ.*")
 	os.Chmod(dir, 0o700)
 	if code(err) != monolink.CodeInternal {
 		t.Fatalf("expected the save to fail: %v", err)
@@ -335,28 +444,28 @@ func TestABrokenStateIsRefused(t *testing.T) {
 // F13: a person from before keys, holding * on paper only, is no
 // administrator: the last one who can sign in keeps *.
 func TestAPersonWithoutAKeyIsNoAdministrator(t *testing.T) {
-	m, _, _ := reviewFixture(t)
+	m, _, token := reviewFixture(t)
 	m.st.Users["legacy"] = &User{Grants: []string{"*"}}
-	if _, _, err := reviewCall(m, "MONOWEB.owner", "STOP", "GRANT", "owner", "*"); code(err) != monolink.CodeState {
+	if _, _, err := reviewCall(m, "MONOWEB.owner", "STOP", "GRANT", token, "owner", "*"); code(err) != monolink.CodeState {
 		t.Fatalf("the last usable * was taken: %v", err)
 	}
 }
 
 // F14: one public key is one person's, whatever id it is offered under.
 func TestOneKeyIsOnePersons(t *testing.T) {
-	m, key, _ := reviewFixture(t)
+	m, key, token := reviewFixture(t)
 	alias := key.cred
 	alias.ID = strings.Repeat("A", 43)
-	iv := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", "guest")[0]
-	if _, _, err := reviewCall(m, "MONOWEB", "AUTH", "REDEEM", append([]string{iv, "guest"}, alias.Args()...)...); err == nil {
+	iv := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", token, "guest")[0]
+	if _, _, err := reviewCall(m, "MONOWEB", "AUTH", "REDEEM", reg(iv, "guest", alias, key.answer(t, m, "MONOWEB", "guest"))...); err == nil {
 		t.Fatal("a panel key was taken under an id not its own")
 	}
 	pass := newPasskey(t, "phone")
-	reviewOK(t, m, "MONOWEB", "AUTH", "REDEEM", append([]string{iv, "guest"}, pass.cred.Args()...)...)
+	reviewOK(t, m, "MONOWEB", "AUTH", "REDEEM", reg(iv, "guest", pass.cred, pass.answer(t, m, "MONOWEB"))...)
 	again := pass.cred
 	again.ID = strings.Repeat("B", 43)
-	iv2 := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", "olga")[0]
-	if _, _, err := reviewCall(m, "MONOWEB", "AUTH", "REDEEM", append([]string{iv2, "olga"}, again.Args()...)...); code(err) != monolink.CodeState {
+	iv2 := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", token, "olga")[0]
+	if _, _, err := reviewCall(m, "MONOWEB", "AUTH", "REDEEM", reg(iv2, "olga", again, pass.answer(t, m, "MONOWEB"))...); code(err) != monolink.CodeState {
 		t.Fatalf("one passkey given to a second person: %v", err)
 	}
 }
@@ -364,19 +473,20 @@ func TestOneKeyIsOnePersons(t *testing.T) {
 // W02: an owner who holds no token for a session taken can still end it:
 // every session, invitation and ticket of a person's, in one step.
 func TestSignOutEverywhere(t *testing.T) {
-	m, key, _ := reviewFixture(t)
+	m, key, token := reviewFixture(t)
 	if _, _, err := m.openSession("owner", "MONOVIEW", key.cred.Ref(), m.now()); err != nil {
 		t.Fatal(err)
 	}
-	iv := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", "owner")[0]
-	reviewOK(t, m, "MONOWEB.owner", "STOP", "SESSIONS", "owner")
+	iv := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", token, "owner")[0]
+	reviewOK(t, m, "MONOWEB.owner", "STOP", "SESSIONS", token, "owner")
 	if len(m.st.Sessions) != 0 {
 		t.Fatalf("%d sessions still open", len(m.st.Sessions))
 	}
 	if _, ok := m.st.Ending["owner"]; !ok {
 		t.Fatal("their tickets were not ended")
 	}
-	if _, _, err := reviewCall(m, "MONOWEB", "AUTH", "REDEEM", append([]string{iv, "owner"}, newPanelKey(t).cred.Args()...)...); err == nil {
+	k := newPanelKey(t)
+	if _, _, err := reviewCall(m, "MONOWEB", "AUTH", "REDEEM", reg(iv, "owner", k.cred, k.answer(t, m, "MONOWEB", "owner"))...); err == nil {
 		t.Fatal("an invitation outlived signing out everywhere")
 	}
 }
