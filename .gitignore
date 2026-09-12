@@ -2,3 +2,4 @@ bin/
 .env
 marshal.json
 marshal.service
+ticket.key
