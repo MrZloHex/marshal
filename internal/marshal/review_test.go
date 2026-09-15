@@ -193,7 +193,7 @@ func TestAnEndedSessionEndsItsTickets(t *testing.T) {
 				// one evicted: at one instant, which goes would be chance.
 				later := m.now().Add(time.Second)
 				for range maxSessions {
-					if _, _, err := m.openSession("owner", "MONOWEB", key.cred.Ref(), later); err != nil {
+					if _, _, err := m.openSession("owner", "MONOWEB", key.cred.Ref(), "", later); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -474,7 +474,7 @@ func TestOneKeyIsOnePersons(t *testing.T) {
 // every session, invitation and ticket of a person's, in one step.
 func TestSignOutEverywhere(t *testing.T) {
 	m, key, token := reviewFixture(t)
-	if _, _, err := m.openSession("owner", "MONOVIEW", key.cred.Ref(), m.now()); err != nil {
+	if _, _, err := m.openSession("owner", "MONOVIEW", key.cred.Ref(), "", m.now()); err != nil {
 		t.Fatal(err)
 	}
 	iv := reviewOK(t, m, "MONOWEB.owner", "NEW", "INVITE", token, "owner")[0]

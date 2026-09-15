@@ -53,9 +53,14 @@ type Key struct {
 
 // Session is one person signed in at one panel, with one of their keys.
 type Session struct {
-	User    string    `json:"user"`
-	Panel   string    `json:"panel"`
-	Key     string    `json:"key"` // its Ref
+	User  string `json:"user"`
+	Panel string `json:"panel"`
+	Key   string `json:"key"` // its Ref: for a browser another device approved, that device's key
+	// Bound is the key a browser signed in from another device holds, and
+	// cannot export: P-256, SubjectPublicKeyInfo, base64url. Such a session
+	// is taken up again only with that key's signature, lasts hours, and
+	// changes nothing that outlasts it (link.go).
+	Bound   string    `json:"bound,omitempty"`
 	Since   time.Time `json:"since"`
 	Expires time.Time `json:"expires"`
 }
@@ -137,7 +142,7 @@ func (st *State) check() error {
 	// A session from before keys, or of a person or key since gone, is no
 	// session to keep.
 	for h, ss := range st.Sessions {
-		if ss == nil || ss.Key == "" || !st.hasKey(ss.User, ss.Key) {
+		if ss == nil || ss.Key == "" || !st.hasKey(ss.User, ss.Key) || (ss.Bound != "" && !validLinkKey(ss.Bound)) {
 			delete(st.Sessions, h)
 		}
 	}

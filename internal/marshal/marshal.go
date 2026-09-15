@@ -90,6 +90,8 @@ type Marshal struct {
 	enrolCode  string // set while nobody can sign in
 	challenges map[string]challenge
 	invites    map[string]invite    // by hashCode
+	links      map[string]*link     // browsers waiting for a device to approve them, by hashToken of their secret
+	linkCodes  map[string]string    // the same, by hashCode of the code they show: to the hashToken of the secret
 	codes      map[string]*lockout  // wrong codes: the enrolment code's by panel, invitations' by panel and name
 	ended      map[string]time.Time // by person: the tickets signed until then are void
 	lastIssued map[string]time.Time // by person: when their latest ticket says it was signed
@@ -117,6 +119,7 @@ func New(c *monolink.Client, store *Store, opt Options) (*Marshal, error) {
 	}
 	m := &Marshal{c: c, store: store, opt: opt, now: time.Now, st: st,
 		challenges: map[string]challenge{}, invites: map[string]invite{}, codes: map[string]*lockout{},
+		links: map[string]*link{}, linkCodes: map[string]string{},
 		ended: map[string]time.Time{}, lastIssued: map[string]time.Time{}, wake: make(chan struct{}, 1)}
 	// Tickets ended before a restart stay ended: none is signed at or before a
 	// cutoff the hub may not have heard yet.
@@ -335,7 +338,7 @@ var arity = map[string][2]int{
 	// challenge and a panel key's signature, or AUTH:PASSKEY's arguments.
 	"AUTH:ENROL":    {9, 16},
 	"AUTH:REDEEM":   {9, 16},
-	"SET:SESSION":   {1, 1}, // token
+	"SET:SESSION":   {1, 3}, // token; for a browser another device approved, then its key's proof: nonce, signature
 	"STOP:SESSION":  {1, 1}, // token
 	"GET:SESSIONS":  {0, 0},
 	"STOP:SESSIONS": {2, 2}, // token, name: every session, invitation and ticket of theirs
@@ -349,6 +352,12 @@ var arity = map[string][2]int{
 	"SET:GRANT":     {3, 3}, // token, user, pattern
 	"STOP:GRANT":    {3, 3}, // token, user, pattern
 	"GET:GRANTS":    {1, 1}, // user
+	// a browser signed in from a device that already is (link.go)
+	"AUTH:LINK":   {2, 3}, // the browser's key and its label; portal adds where it asked from
+	"AUTH:LINKED": {1, 3}, // secret: waiting or ready; secret, nonce, signature: the session
+	"GET:LINK":    {2, 2}, // token, code: what is being asked
+	"SET:LINK":    {2, 2}, // token, code: approved
+	"STOP:LINK":   {2, 2}, // token, code: refused
 }
 
 // changes are the requests that change people, keys or grants. Each names
@@ -356,7 +365,13 @@ var arity = map[string][2]int{
 var changes = map[string]bool{
 	"NEW:INVITE": true, "STOP:KEY": true, "STOP:USER": true,
 	"SET:GRANT": true, "STOP:GRANT": true, "STOP:SESSIONS": true,
+	"SET:LINK": true,
 }
+
+// withSession name a session of the asker's by its token too, but change
+// nothing, and need no fresh sign-in: looking at a sign-in waiting for
+// approval, and refusing it.
+var withSession = map[string]bool{"GET:LINK": true, "STOP:LINK": true}
 
 // Cmd serves every request to marshal that its object model does not:
 // signing in, sessions, people and grants.
@@ -441,6 +456,7 @@ func (m *Marshal) serve(msg monolink.Message) (string, []string, error) {
 	defer m.mu.Unlock()
 	now := m.now()
 	m.expire(now)
+	m.sweepLinks(now)
 
 	switch key {
 	case "AUTH:CHALLENGE":
@@ -458,13 +474,17 @@ func (m *Marshal) serve(msg monolink.Message) (string, []string, error) {
 		}
 		return m.redeem(panel, a[0], a[1], a[2:7], a[7:], answered, now)
 	case "SET:SESSION":
-		return m.keepAlive(panel, a[0], now)
+		return m.keepAlive(panel, a[0], a[1:], now)
+	case "AUTH:LINK":
+		return m.askLink(panel, a, now)
+	case "AUTH:LINKED":
+		return m.linked(panel, a, now)
 	case "STOP:SESSION":
 		return m.endSession(panel, a[0], now)
 	case "GET:ALLOW":
-		return m.allow(panel, a[0], a[1], now)
+		return m.allow(panel, from.Actor, a[0], a[1], now)
 	case "GET:TICKET":
-		return m.ticket(panel, a[0], now)
+		return m.ticket(panel, from.Actor, a[0], now)
 	}
 
 	// The rest administer people, and are themselves actions: MARSHAL.*.
@@ -480,13 +500,22 @@ func (m *Marshal) serve(msg monolink.Message) (string, []string, error) {
 	// whatever would outlive signing it out — and another session's fresh
 	// sign-in lends it nothing. Signing oneself out everywhere takes nothing
 	// but sessions, and needs only a session.
-	if changes[key] {
+	var sess *Session // the session named, for a change or for a look at a sign-in to approve
+	if changes[key] || withSession[key] {
 		s, _, err := m.session(panel, a[0], now)
 		if err != nil || s.User != who {
 			return "", nil, monolink.Fail(monolink.CodeDenied, "not a session of yours at this panel")
 		}
-		a = a[1:]
-		if now.Sub(s.Since) > freshSignIn && !(key == "STOP:SESSIONS" && a[0] == who) {
+		sess, a = s, a[1:]
+	}
+	if changes[key] && !(key == "STOP:SESSIONS" && a[0] == who) {
+		// A browser another device approved holds a session and nothing
+		// more: nothing it does may outlast it — a key, a grant, a person, or
+		// another browser approved.
+		if sess.Bound != "" {
+			return "", nil, monolink.Fail(monolink.CodeDenied, "a browser another device signed in changes nothing: sign in with a key of your own")
+		}
+		if now.Sub(sess.Since) > freshSignIn {
 			return "", nil, monolink.Fail(monolink.CodeDenied, "sign in again: a change to people, keys or grants needs a sign-in within five minutes")
 		}
 	}
@@ -501,6 +530,9 @@ func (m *Marshal) serve(msg monolink.Message) (string, []string, error) {
 		if err := m.mayInvite(who, a[0]); err != nil {
 			return "", nil, err
 		}
+	case "GET:LINK", "SET:LINK", "STOP:LINK":
+		// One's own sign-in, in another browser: one's own to approve, as
+		// inviting oneself is. Nobody approves a sign-in as someone else.
 	default:
 		if err := m.permit(who, msg.Verb, msg.Noun); err != nil {
 			return "", nil, err
@@ -539,6 +571,12 @@ func (m *Marshal) serve(msg monolink.Message) (string, []string, error) {
 		return m.setGrant(a[0], a[1])
 	case "STOP:GRANT":
 		return m.stopGrant(a[0], a[1])
+	case "GET:LINK":
+		return m.linkInfo(panel, who, a[0], now)
+	case "SET:LINK":
+		return m.approveLink(panel, who, sess, a[0], now)
+	case "STOP:LINK":
+		return m.refuseLink(panel, who, a[0], now)
 	default: // GET:GRANTS
 		return m.getGrants(a[0])
 	}
@@ -613,7 +651,7 @@ func (m *Marshal) passkey(panel string, args []string, now time.Time) (string, [
 	// memory as the file is.
 	snap := m.snapshot()
 	k.Count = count
-	noun, out, err := m.openSession(name, panel, k.Ref, now)
+	noun, out, err := m.openSession(name, panel, k.Ref, "", now)
 	if err != nil {
 		m.st = snap
 		return "", nil, err
@@ -631,7 +669,7 @@ func (m *Marshal) panelKey(panel, nonce, name, id, sig string, now time.Time) (s
 	if k == nil || owner != name || err != nil || auth.VerifyKey(k.Credential, name, panel, nonce, raw) != nil {
 		return "", nil, monolink.Fail(monolink.CodeDenied, "")
 	}
-	return m.openSession(name, panel, k.Ref, now)
+	return m.openSession(name, panel, k.Ref, "", now)
 }
 
 // enrol makes the first person, by the code marshal printed: their key,
@@ -667,7 +705,7 @@ func (m *Marshal) enrol(panel, code, name string, cred, proof []string, answered
 	}
 	k := &Key{Credential: c, Ref: c.Ref(), Added: now}
 	u.Keys = append(u.Keys, k)
-	noun, args, err := m.openSession(name, panel, k.Ref, now)
+	noun, args, err := m.openSession(name, panel, k.Ref, "", now)
 	if err != nil {
 		m.st = snap // enrolment stays open: nobody was made
 		return "", nil, err
@@ -869,7 +907,7 @@ func (m *Marshal) redeem(panel, code, name string, cred, proof []string, answere
 	u.Keys = append(u.Keys, k)
 	// Someone who existed may do more on their new device than the ticket
 	// on their old one says — nothing, but tickets are cheap to renew.
-	noun, args, err := m.openSession(name, panel, k.Ref, now)
+	noun, args, err := m.openSession(name, panel, k.Ref, "", now)
 	if err != nil {
 		m.st = snap
 		return "", nil, err
@@ -882,7 +920,7 @@ func (m *Marshal) redeem(panel, code, name string, cred, proof []string, answere
 
 // ─── sessions ────────────────────────────────────────────────────────
 
-func (m *Marshal) openSession(user, panel, key string, now time.Time) (string, []string, error) {
+func (m *Marshal) openSession(user, panel, key, bound string, now time.Time) (string, []string, error) {
 	snap := m.snapshot()
 	// A panel signing in over and over — a fault, or a panel taken over —
 	// ends its person's oldest sessions, not marshal's patience.
@@ -903,7 +941,7 @@ func (m *Marshal) openSession(user, panel, key string, now time.Time) (string, [
 		m.endTickets(user)
 	}
 	token := randHex(32)
-	s := &Session{User: user, Panel: panel, Key: key, Since: now}
+	s := &Session{User: user, Panel: panel, Key: key, Bound: bound, Since: now}
 	m.extend(s, now)
 	m.st.Sessions[hashToken(token)] = s
 	if err := m.save(); err != nil {
@@ -934,14 +972,38 @@ func (m *Marshal) session(panel, token string, now time.Time) (*Session, string,
 // sign-in: a stolen token, renewed faithfully, still dies.
 func (m *Marshal) extend(s *Session, now time.Time) {
 	s.Expires = now.Add(m.opt.TTL)
-	if limit := s.Since.Add(maxSessionAge); s.Expires.After(limit) {
+	limit := s.Since.Add(maxSessionAge)
+	if s.Bound != "" {
+		limit = s.Since.Add(linkMaxAge) // a browser another device approved: hours, not a month
+	}
+	if s.Expires.After(limit) {
 		s.Expires = limit
 	}
 }
 
-func (m *Marshal) keepAlive(panel, token string, now time.Time) (string, []string, error) {
+// panelSession is the session a panel asks about by its token: asked by the
+// panel itself, or by the person signed in there — never by someone else
+// signed in at the same panel. Every browser is MONOWEB: without this, a
+// person holding another's token could have their ticket signed through
+// portal, and a browser another device approved would be worth its token
+// alone, not its key.
+func (m *Marshal) panelSession(panel, actor, token string, now time.Time) (*Session, error) {
 	s, _, err := m.session(panel, token, now)
 	if err != nil {
+		return nil, err
+	}
+	if actor != "" && actor != s.User {
+		return nil, monolink.Fail(monolink.CodeDenied, "not a session of yours")
+	}
+	return s, nil
+}
+
+func (m *Marshal) keepAlive(panel, token string, proof []string, now time.Time) (string, []string, error) {
+	s, _, err := m.session(panel, token, now)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := m.resumeProof(panel, token, s, proof, now); err != nil {
 		return "", nil, err
 	}
 	old := s.Expires
@@ -974,8 +1036,8 @@ func (m *Marshal) endSession(panel, token string, now time.Time) (string, []stri
 	return auth.NounSession, sessionArgs(token, s.User, now), nil
 }
 
-func (m *Marshal) allow(panel, token, action string, now time.Time) (string, []string, error) {
-	s, _, err := m.session(panel, token, now)
+func (m *Marshal) allow(panel, actor, token, action string, now time.Time) (string, []string, error) {
+	s, err := m.panelSession(panel, actor, token, now)
 	if err != nil {
 		return "", nil, err
 	}
@@ -993,11 +1055,11 @@ func (m *Marshal) allow(panel, token, action string, now time.Time) (string, []s
 // Asking for one is using the session, and keeps it open: a panel renews its
 // ticket every few minutes while it is connected, and a session nobody
 // renews ends within TTL.
-func (m *Marshal) ticket(panel, token string, now time.Time) (string, []string, error) {
+func (m *Marshal) ticket(panel, actor, token string, now time.Time) (string, []string, error) {
 	if m.opt.TicketKey == nil {
 		return "", nil, monolink.Fail(monolink.CodeState, "marshal has no key to sign tickets with")
 	}
-	s, _, err := m.session(panel, token, now)
+	s, err := m.panelSession(panel, actor, token, now)
 	if err != nil {
 		return "", nil, err
 	}
